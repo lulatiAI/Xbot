@@ -4,6 +4,7 @@ import requests
 import tweepy
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 # --- Load environment variables ---
 load_dotenv()
@@ -156,12 +157,21 @@ def reply_to_mentions():
 
         store_last_seen_id(mention.id)
 
-# --- FastAPI app for health check ---
+# --- FastAPI app for health check and question testing ---
 app = FastAPI()
 
 @app.get("/")
 def read_root():
     return {"status": "running", "bot": BOT_USERNAME, "bot_id": BOT_ID}
+
+# New: POST /ask endpoint to test your bot with custom questions
+class Question(BaseModel):
+    question: str
+
+@app.post("/ask")
+def ask_bot(q: Question):
+    answer = get_ai_response(q.question)
+    return {"answer": answer}
 
 # --- Background polling loop ---
 if __name__ == "__main__":
