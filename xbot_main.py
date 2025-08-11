@@ -5,14 +5,12 @@ import tweepy
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-# Load environment variables
 load_dotenv()
 
-# --- API Keys from environment variables ---
+# --- API Keys ---
 API_KEY = os.getenv("API_KEY")
-API_KEY_SECRET = os.getenv("API_KEY_SECRET")  # updated var name to match env
+API_KEY_SECRET = os.getenv("API_KEY_SECRET")  # corrected name to match your env
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
@@ -25,81 +23,75 @@ api = tweepy.API(auth)
 
 BOT_ID = api.verify_credentials().id
 BOT_HANDLE = api.me().screen_name.lower()
-last_seen_id = None  # Could store this in a file/db for persistence
+last_seen_id = None  # could persist in a file/db
 
-# --- Locations to track ---
+# --- Local city/state list ---
 LOCAL_PLACES = [
     "chicago", "new york", "los angeles", "atlanta", "houston", "dallas",
     "miami", "washington", "north carolina", "south carolina", "detroit",
     "baltimore", "philadelphia", "new orleans", "oakland"
 ]
 
-# --- Fetch news articles ---
+# --- Utility Functions ---
 def get_news(query):
-    url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}&language=en&pageSize=1"
-    response = requests.get(url)
-    if response.status_code == 200:
-        articles = response.json().get("articles", [])
-        if articles:
-            return articles[0]["title"] + " - " + articles[0]["url"]
-    return None
-
-# --- Generate AI response from backend ---
-def get_ai_response(prompt):
+    """Fetch latest news headline matching query from News API."""
     try:
-        response = requests.post(f"{AI_BACKEND_URL}/generate", json={"prompt": prompt})
-        if response.status_code == 200:
-            return response.json().get("response", "No response")
+        url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}&pageSize=1&sortBy=publishedAt"
+        r = requests.get(url)
+        r.raise_for_status()
+        articles = r.json().get("articles", [])
+        if articles:
+            return f"{articles[0]['title']} - {articles[0]['url']}"
+        return None
     except Exception as e:
-        print(f"AI backend error: {e}")
-    return "Error connecting to AI backend."
+        print("Error fetching news:", e)
+        return None
 
-# --- Process mentions ---
-def process_mentions():
+def get_ai_response(prompt):
+    """Send prompt to AI backend for text response."""
+    try:
+        r = requests.post(f"{AI_BACKEND_URL}/generate-text", json={"prompt": prompt})
+        r.raise_for_status()
+        return r.json().get("response", "I couldn't process that.")
+    except Exception as e:
+        print("Error getting AI response:", e)
+        return "Sorry, I had an error processing your request."
+
+def process_mention(mention):
+    """Process a mention and reply accordingly."""
+    print(f"Processing mention from {mention.user.screen_name}: {mention.text}")
+    lower_text = mention.text.lower()
+
+    # Avoid replying to self
+    if mention.user.id == BOT_ID:
+        return
+
+    # Check for local news
+    for place in LOCAL_PLACES:
+        if place in lower_text:
+            news = get_news(place)
+            if news:
+                reply_text = f"@{mention.user.screen_name} Here's the latest news on {place}: {news}"
+            else:
+                reply_text = f"@{mention.user.screen_name} Couldn't find recent news for {place}."
+            api.update_status(reply_text, in_reply_to_status_id=mention.id)
+            return
+
+    # General AI reply
+    ai_reply = get_ai_response(lower_text)
+    reply_text = f"@{mention.user.screen_name} {ai_reply}"
+    api.update_status(reply_text, in_reply_to_status_id=mention.id)
+
+def check_mentions():
+    """Periodically check mentions."""
     global last_seen_id
+    print("Checking mentions...")
     mentions = api.mentions_timeline(since_id=last_seen_id, tweet_mode="extended")
     for mention in reversed(mentions):
-        print(f"New mention from {mention.user.screen_name}: {mention.full_text}")
         last_seen_id = mention.id
-        user_text = mention.full_text.replace(f"@{BOT_HANDLE}", "").strip()
-
-        # Try to match with a local news place
-        news_result = None
-        for place in LOCAL_PLACES:
-            if place in user_text.lower():
-                news_result = get_news(place)
-                break
-
-        # AI reply if no local match
-        if not news_result:
-            news_result = get_ai_response(user_text)
-
-        reply_text = f"@{mention.user.screen_name} {news_result or 'I could not find any info.'}"
-        try:
-            api.update_status(status=reply_text, in_reply_to_status_id=mention.id)
-        except Exception as e:
-            print(f"Error replying: {e}")
-
-# --- Thread to continuously check mentions ---
-def run_bot():
-    while True:
-        try:
-            process_mentions()
-        except Exception as e:
-            print(f"Bot error: {e}")
-        time.sleep(60)
+        process_mention(mention)
 
 # --- FastAPI app ---
 app = FastAPI()
 
 @app.get("/")
-def home():
-    return JSONResponse({"message": "X Bot is running."})
-
-@app.post("/trigger-bot")
-def trigger_bot():
-    threading.Thread(target=process_mentions).start()
-    return JSONResponse({"message": "Bot triggered."})
-
-# --- Start bot on background thread ---
-threading.Thread(target=run_bot, daemon=True).start()
