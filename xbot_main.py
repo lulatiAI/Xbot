@@ -15,10 +15,9 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")  # Default bot username
 
-# --- Authenticate with X API v2 ---
+# --- Authenticate with Twitter API v2 ---
 client = tweepy.Client(
     bearer_token=BEARER_TOKEN,
     consumer_key=API_KEY,
@@ -47,29 +46,22 @@ def store_last_seen_id(last_seen_id):
     with open(last_seen_id_file, "w") as f:
         f.write(str(last_seen_id))
 
-# --- Get AI-generated response via OpenAI ---
+# --- Get AI-generated response using OpenAI ---
 def get_ai_response(user_question):
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "gpt-4o-mini",  # Change if you want another model
-        "messages": [
-            {"role": "user", "content": user_question}
-        ],
-        "max_tokens": 150,
-        "temperature": 0.7,
-    }
+    import openai
+    openai.api_key = os.getenv("OPENAI_API_KEY")
 
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=15)
-        if response.status_code == 200:
-            resp_json = response.json()
-            return resp_json["choices"][0]["message"]["content"].strip()
-        else:
-            return f"OpenAI API error: {response.status_code} - {response.text}"
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "user", "content": user_question}
+            ],
+            max_tokens=150,
+            temperature=0.7
+        )
+        answer = response.choices[0].message.content.strip()
+        return answer
     except Exception as e:
         return f"Error: {e}"
 
@@ -93,7 +85,7 @@ def get_username(user_id):
     user_data = client.get_user(id=user_id)
     return user_data.data.username
 
-# --- Process mentions ---
+# --- Process mentions and reply ---
 def reply_to_mentions():
     print("Checking for mentions...")
     last_seen_id = retrieve_last_seen_id()
@@ -129,11 +121,12 @@ def reply_to_mentions():
         wants_news = any(keyword in user_lower for keyword in ["news", "sports", "movies", "weather", "headlines"])
 
         if wants_news:
-            # Naive topic extraction
+            # Extract possible topic or location from question by removing keywords
             for keyword in ["news", "sports", "movies", "weather", "headlines"]:
                 user_question = user_question.replace(keyword, "")
             topic = user_question.strip() or None
 
+            # Fetch news articles
             articles = fetch_news(query=topic)
 
             if not articles:
@@ -149,7 +142,7 @@ def reply_to_mentions():
                     reply_lines = [f"{i+1}. {a.get('title')} - {a.get('url')}" for i, a in enumerate(articles[:3])]
                     reply_text = f"@{get_username(mention.author_id)} Here are some recent articles:\n" + "\n".join(reply_lines)
         else:
-            # General AI response
+            # Default: ask AI for answer
             answer = get_ai_response(user_question)
             reply_text = f"@{get_username(mention.author_id)} {answer}"
 
@@ -164,4 +157,23 @@ def reply_to_mentions():
 
         store_last_seen_id(mention.id)
 
-# --- FastAPI app fo
+# --- FastAPI app ---
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"status": "running", "bot": BOT_USERNAME, "bot_id": BOT_ID}
+
+class Question(BaseModel):
+    question: str
+
+@app.post("/ask")
+def ask_bot(q: Question):
+    answer = get_ai_response(q.question)
+    return {"answer": answer}
+
+# --- Run mention poller in background if running standalone ---
+if __name__ == "__main__":
+    while True:
+        reply_to_mentions()
+        time.sleep(30)
