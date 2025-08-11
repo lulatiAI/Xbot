@@ -3,9 +3,8 @@ import time
 import requests
 import tweepy
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
-import re
 
 # --- Load environment variables ---
 load_dotenv()
@@ -16,8 +15,8 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-AI_BACKEND_URL = os.getenv("AI_BACKEND_URL")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")  # Default bot username (without @)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")  # Default bot username
 
 # --- Authenticate with X API v2 ---
 client = tweepy.Client(
@@ -48,20 +47,29 @@ def store_last_seen_id(last_seen_id):
     with open(last_seen_id_file, "w") as f:
         f.write(str(last_seen_id))
 
-# --- Get AI-generated response ---
-def get_ai_response(user_question: str) -> str:
+# --- Get AI-generated response via OpenAI ---
+def get_ai_response(user_question):
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": "gpt-4o-mini",  # Change if you want another model
+        "messages": [
+            {"role": "user", "content": user_question}
+        ],
+        "max_tokens": 150,
+        "temperature": 0.7,
+    }
+
     try:
-        resp = requests.post(
-            f"{AI_BACKEND_URL}/chat",
-            json={"prompt": user_question},
-            timeout=15
-        )
-        if resp.status_code == 200:
-            json_resp = resp.json()
-            # Support either "response" or fallback key for answer
-            return json_resp.get("response") or json_resp.get("answer") or "I’m not sure how to answer that right now."
+        response = requests.post(url, headers=headers, json=data, timeout=15)
+        if response.status_code == 200:
+            resp_json = response.json()
+            return resp_json["choices"][0]["message"]["content"].strip()
         else:
-            return "Hmm, I’m having trouble thinking right now."
+            return f"OpenAI API error: {response.status_code} - {response.text}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -80,7 +88,7 @@ def fetch_news(query=None, category=None, country="us"):
     data = response.json()
     return data.get("articles", [])
 
-# --- Helper to get username from ID ---
+# --- Helper to get username from user ID ---
 def get_username(user_id):
     user_data = client.get_user(id=user_id)
     return user_data.data.username
@@ -107,9 +115,8 @@ def reply_to_mentions():
         if mention.author_id == BOT_ID:
             continue
 
-        # Remove @botname from text (case insensitive)
-        pattern = re.compile(rf"@{re.escape(BOT_USERNAME)}", re.IGNORECASE)
-        user_question = pattern.sub("", mention.text).strip()
+        # Remove @botname from text
+        user_question = mention.text.replace(f"@{BOT_USERNAME}", "").strip()
 
         # Only reply if it's a question
         if not user_question.endswith("?"):
@@ -117,23 +124,21 @@ def reply_to_mentions():
 
         user_lower = user_question.lower()
 
-        # Detect if user is asking for news or summaries
-        wants_summary = any(keyword in user_lower for keyword in ["summary", "summarize", "summarise"])
+        # Detect if user wants news or summaries
+        wants_summary = "summary" in user_lower or "summarize" in user_lower or "summarise" in user_lower
         wants_news = any(keyword in user_lower for keyword in ["news", "sports", "movies", "weather", "headlines"])
 
         if wants_news:
-            # Extract possible topic or location from question, naive approach: remove keywords
+            # Naive topic extraction
             for keyword in ["news", "sports", "movies", "weather", "headlines"]:
                 user_question = user_question.replace(keyword, "")
             topic = user_question.strip() or None
 
-            # Fetch news (country default "us")
             articles = fetch_news(query=topic)
 
             if not articles:
                 reply_text = f"@{get_username(mention.author_id)} Sorry, I couldn't find news articles on that topic."
             else:
-                # If summary requested, ask AI backend to summarize first article
                 if wants_summary:
                     article_url = articles[0].get("url")
                     article_title = articles[0].get("title")
@@ -141,11 +146,10 @@ def reply_to_mentions():
                     summary = get_ai_response(summary_prompt)
                     reply_text = f"@{get_username(mention.author_id)} Summary of '{article_title}': {summary}\nRead more: {article_url}"
                 else:
-                    # Just list top 3 article titles + URLs
                     reply_lines = [f"{i+1}. {a.get('title')} - {a.get('url')}" for i, a in enumerate(articles[:3])]
                     reply_text = f"@{get_username(mention.author_id)} Here are some recent articles:\n" + "\n".join(reply_lines)
         else:
-            # Default: just pass to AI backend for general question answering
+            # General AI response
             answer = get_ai_response(user_question)
             reply_text = f"@{get_username(mention.author_id)} {answer}"
 
@@ -160,40 +164,4 @@ def reply_to_mentions():
 
         store_last_seen_id(mention.id)
 
-# --- FastAPI app for health check and question testing ---
-app = FastAPI()
-
-@app.get("/")
-def read_root():
-    return {"status": "running", "bot": BOT_USERNAME, "bot_id": BOT_ID}
-
-class Question(BaseModel):
-    question: str
-
-@app.post("/ask")
-def ask_bot(q: Question):
-    # Validate bot mention present
-    if f"@{BOT_USERNAME}".lower() not in q.question.lower():
-        raise HTTPException(status_code=400, detail=f"Question must mention @{BOT_USERNAME}")
-    
-    # Extract question after mention
-    pattern = re.compile(rf"@{re.escape(BOT_USERNAME)}", re.IGNORECASE)
-    parts = pattern.split(q.question, maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        raise HTTPException(status_code=400, detail="No question text after bot mention")
-
-    clean_question = parts[1].strip()
-
-    answer = get_ai_response(clean_question)
-    return {"answer": answer}
-
-# Optional: add /chat endpoint same as /ask
-@app.post("/chat")
-def chat_bot(q: Question):
-    return ask_bot(q)
-
-# --- Background polling loop (if running as script) ---
-if __name__ == "__main__":
-    while True:
-        reply_to_mentions()
-        time.sleep(30)  # Check every 30 seconds
+# --- FastAPI app fo
