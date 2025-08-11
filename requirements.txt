@@ -1,5 +1,5 @@
-tweepy
-requests
-python-dotenv
-fastapi
-uvicorn
+fastapi==0.110.0
+uvicorn==0.29.0
+tweepy==4.14.0
+python-dotenv==1.0.1
+requests==2.31.0
