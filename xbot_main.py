@@ -3,9 +3,10 @@ import logging
 import tweepy
 import requests
 from fastapi import FastAPI
+from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
-# Load environment variables from .env if running locally
+# Load env vars if running locally
 load_dotenv()
 
 # Configure logging
@@ -19,7 +20,6 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-AI_BACKEND_URL = os.getenv("AI_BACKEND_URL")
 
 # Validate required env vars
 required_vars = {
@@ -58,7 +58,7 @@ def tweet_news_headlines():
     if not headlines:
         logger.warning("No headlines to tweet.")
         return
-    for headline in headlines[:5]:  # limit to 5 tweets at a time
+    for headline in headlines[:5]:
         try:
             twitter_api.update_status(headline)
             logger.info(f"Tweeted: {headline}")
@@ -74,6 +74,16 @@ def tweet_news():
     tweet_news_headlines()
     return {"status": "success", "message": "News headlines tweeted"}
 
+# Scheduler to tweet every hour
+scheduler = BackgroundScheduler()
+scheduler.add_job(tweet_news_headlines, "interval", hours=1)
+scheduler.start()
+
+@app.on_event("shutdown")
+def shutdown_event():
+    scheduler.shutdown()
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
