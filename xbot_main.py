@@ -3,7 +3,7 @@ import time
 import requests
 import tweepy
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # --- Load environment variables ---
@@ -15,6 +15,7 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")  # Default bot username
 
 # --- Authenticate with Twitter API v2 ---
@@ -28,9 +29,13 @@ client = tweepy.Client(
 )
 
 # --- Get bot's numeric ID from username ---
-bot_user_data = client.get_user(username=BOT_USERNAME)
-BOT_ID = bot_user_data.data.id
-print(f"Bot username: @{BOT_USERNAME}, Bot ID: {BOT_ID}")
+try:
+    bot_user_data = client.get_user(username=BOT_USERNAME)
+    BOT_ID = bot_user_data.data.id
+    print(f"Bot username: @{BOT_USERNAME}, Bot ID: {BOT_ID}")
+except Exception as e:
+    print(f"Error getting bot user data: {e}")
+    BOT_ID = None  # Fail gracefully
 
 # --- Track last processed mention ---
 last_seen_id_file = "last_seen_id.txt"
@@ -41,60 +46,87 @@ def retrieve_last_seen_id():
             return int(f.read().strip())
     except FileNotFoundError:
         return None
+    except Exception as e:
+        print(f"Error reading last_seen_id file: {e}")
+        return None
 
 def store_last_seen_id(last_seen_id):
-    with open(last_seen_id_file, "w") as f:
-        f.write(str(last_seen_id))
+    try:
+        with open(last_seen_id_file, "w") as f:
+            f.write(str(last_seen_id))
+    except Exception as e:
+        print(f"Error writing last_seen_id file: {e}")
 
 # --- Get AI-generated response using OpenAI ---
 def get_ai_response(user_question):
     import openai
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+    openai.api_key = OPENAI_API_KEY
+
+    if not openai.api_key:
+        return "OpenAI API key not configured."
 
     try:
         response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "user", "content": user_question}
-            ],
+            messages=[{"role": "user", "content": user_question}],
             max_tokens=150,
             temperature=0.7
         )
         answer = response.choices[0].message.content.strip()
         return answer
     except Exception as e:
-        return f"Error: {e}"
+        print(f"OpenAI API error: {e}")
+        return "Sorry, I couldn't process your question right now."
 
 # --- Fetch news articles from NewsAPI ---
 def fetch_news(query=None, category=None, country="us"):
+    if not NEWS_API_KEY:
+        print("NEWS_API_KEY not set.")
+        return []
+
     url = "https://newsapi.org/v2/top-headlines"
     params = {"apiKey": NEWS_API_KEY, "country": country}
     if query:
         params["q"] = query
     if category:
         params["category"] = category
-    response = requests.get(url, params=params)
-    if response.status_code != 200:
-        print(f"NewsAPI error: {response.status_code} {response.text}")
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("articles", [])
+    except Exception as e:
+        print(f"NewsAPI error: {e}")
         return []
-    data = response.json()
-    return data.get("articles", [])
 
 # --- Helper to get username from user ID ---
 def get_username(user_id):
-    user_data = client.get_user(id=user_id)
-    return user_data.data.username
+    try:
+        user_data = client.get_user(id=user_id)
+        return user_data.data.username
+    except Exception as e:
+        print(f"Error fetching username for user_id {user_id}: {e}")
+        return "user"
 
 # --- Process mentions and reply ---
 def reply_to_mentions():
+    if BOT_ID is None:
+        print("Bot ID not set; skipping mention replies.")
+        return
+
     print("Checking for mentions...")
     last_seen_id = retrieve_last_seen_id()
 
-    mentions = client.get_users_mentions(
-        id=BOT_ID,
-        since_id=last_seen_id,
-        tweet_fields=["created_at", "author_id", "text"]
-    )
+    try:
+        mentions = client.get_users_mentions(
+            id=BOT_ID,
+            since_id=last_seen_id,
+            tweet_fields=["created_at", "author_id", "text"]
+        )
+    except Exception as e:
+        print(f"Error fetching mentions: {e}")
+        return
 
     if not mentions.data:
         print("No new mentions.")
@@ -103,11 +135,10 @@ def reply_to_mentions():
     for mention in reversed(mentions.data):
         print(f"Processing mention from user_id={mention.author_id}: {mention.text}")
 
-        # Skip if self-reply
+        # Skip self-reply
         if mention.author_id == BOT_ID:
             continue
 
-        # Remove @botname from text
         user_question = mention.text.replace(f"@{BOT_USERNAME}", "").strip()
 
         # Only reply if it's a question
@@ -115,26 +146,24 @@ def reply_to_mentions():
             continue
 
         user_lower = user_question.lower()
-
-        # Detect if user wants news or summaries
-        wants_summary = "summary" in user_lower or "summarize" in user_lower or "summarise" in user_lower
-        wants_news = any(keyword in user_lower for keyword in ["news", "sports", "movies", "weather", "headlines"])
+        wants_summary = any(x in user_lower for x in ["summary", "summarize", "summarise"])
+        wants_news = any(x in user_lower for x in ["news", "sports", "movies", "weather", "headlines"])
 
         if wants_news:
-            # Extract possible topic or location from question by removing keywords
+            # Remove keywords to get topic
             for keyword in ["news", "sports", "movies", "weather", "headlines"]:
                 user_question = user_question.replace(keyword, "")
             topic = user_question.strip() or None
 
-            # Fetch news articles
             articles = fetch_news(query=topic)
 
             if not articles:
                 reply_text = f"@{get_username(mention.author_id)} Sorry, I couldn't find news articles on that topic."
             else:
                 if wants_summary:
-                    article_url = articles[0].get("url")
-                    article_title = articles[0].get("title")
+                    article = articles[0]
+                    article_url = article.get("url")
+                    article_title = article.get("title")
                     summary_prompt = f"Summarize this article briefly:\nTitle: {article_title}\nURL: {article_url}"
                     summary = get_ai_response(summary_prompt)
                     reply_text = f"@{get_username(mention.author_id)} Summary of '{article_title}': {summary}\nRead more: {article_url}"
@@ -142,7 +171,6 @@ def reply_to_mentions():
                     reply_lines = [f"{i+1}. {a.get('title')} - {a.get('url')}" for i, a in enumerate(articles[:3])]
                     reply_text = f"@{get_username(mention.author_id)} Here are some recent articles:\n" + "\n".join(reply_lines)
         else:
-            # Default: ask AI for answer
             answer = get_ai_response(user_question)
             reply_text = f"@{get_username(mention.author_id)} {answer}"
 
@@ -169,8 +197,12 @@ class Question(BaseModel):
 
 @app.post("/ask")
 def ask_bot(q: Question):
-    answer = get_ai_response(q.question)
-    return {"answer": answer}
+    try:
+        answer = get_ai_response(q.question)
+        return {"answer": answer}
+    except Exception as e:
+        print(f"Error in /ask endpoint: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # --- Run mention poller in background if running standalone ---
 if __name__ == "__main__":
