@@ -3,8 +3,9 @@ import time
 import requests
 import tweepy
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import re
 
 # --- Load environment variables ---
 load_dotenv()
@@ -16,7 +17,7 @@ ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 AI_BACKEND_URL = os.getenv("AI_BACKEND_URL")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")  # Default bot username
+BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")  # Default bot username (without @)
 
 # --- Authenticate with X API v2 ---
 client = tweepy.Client(
@@ -48,7 +49,7 @@ def store_last_seen_id(last_seen_id):
         f.write(str(last_seen_id))
 
 # --- Get AI-generated response ---
-def get_ai_response(user_question):
+def get_ai_response(user_question: str) -> str:
     try:
         resp = requests.post(
             f"{AI_BACKEND_URL}/chat",
@@ -56,7 +57,9 @@ def get_ai_response(user_question):
             timeout=15
         )
         if resp.status_code == 200:
-            return resp.json().get("response", "I’m not sure how to answer that right now.")
+            json_resp = resp.json()
+            # Support either "response" or fallback key for answer
+            return json_resp.get("response") or json_resp.get("answer") or "I’m not sure how to answer that right now."
         else:
             return "Hmm, I’m having trouble thinking right now."
     except Exception as e:
@@ -104,8 +107,9 @@ def reply_to_mentions():
         if mention.author_id == BOT_ID:
             continue
 
-        # Remove @botname from text
-        user_question = mention.text.replace(f"@{BOT_USERNAME}", "").strip()
+        # Remove @botname from text (case insensitive)
+        pattern = re.compile(rf"@{re.escape(BOT_USERNAME)}", re.IGNORECASE)
+        user_question = pattern.sub("", mention.text).strip()
 
         # Only reply if it's a question
         if not user_question.endswith("?"):
@@ -114,8 +118,7 @@ def reply_to_mentions():
         user_lower = user_question.lower()
 
         # Detect if user is asking for news or summaries
-        wants_summary = "summary" in user_lower or "summarize" in user_lower or "summarise" in user_lower
-        # Check if user asks about news or related topics
+        wants_summary = any(keyword in user_lower for keyword in ["summary", "summarize", "summarise"])
         wants_news = any(keyword in user_lower for keyword in ["news", "sports", "movies", "weather", "headlines"])
 
         if wants_news:
@@ -164,16 +167,32 @@ app = FastAPI()
 def read_root():
     return {"status": "running", "bot": BOT_USERNAME, "bot_id": BOT_ID}
 
-# New: POST /ask endpoint to test your bot with custom questions
 class Question(BaseModel):
     question: str
 
 @app.post("/ask")
 def ask_bot(q: Question):
-    answer = get_ai_response(q.question)
+    # Validate bot mention present
+    if f"@{BOT_USERNAME}".lower() not in q.question.lower():
+        raise HTTPException(status_code=400, detail=f"Question must mention @{BOT_USERNAME}")
+    
+    # Extract question after mention
+    pattern = re.compile(rf"@{re.escape(BOT_USERNAME)}", re.IGNORECASE)
+    parts = pattern.split(q.question, maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        raise HTTPException(status_code=400, detail="No question text after bot mention")
+
+    clean_question = parts[1].strip()
+
+    answer = get_ai_response(clean_question)
     return {"answer": answer}
 
-# --- Background polling loop ---
+# Optional: add /chat endpoint same as /ask
+@app.post("/chat")
+def chat_bot(q: Question):
+    return ask_bot(q)
+
+# --- Background polling loop (if running as script) ---
 if __name__ == "__main__":
     while True:
         reply_to_mentions()
