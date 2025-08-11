@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import re
+import asyncio
 from openai import OpenAI
 
 # --- Load environment variables ---
@@ -17,11 +18,11 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")  # Default bot username
+BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY is not set in environment variables")
+    raise ValueError("OPENAI_API_KEY is not set")
 
 # --- Initialize OpenAI client ---
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -36,12 +37,11 @@ client = tweepy.Client(
     wait_on_rate_limit=True
 )
 
-# --- Get bot's numeric ID from username ---
+# --- Get bot's numeric ID ---
 bot_user_data = client.get_user(username=BOT_USERNAME)
 BOT_ID = bot_user_data.data.id
 print(f"Bot username: @{BOT_USERNAME}, Bot ID: {BOT_ID}")
 
-# --- Track last processed mention ---
 last_seen_id_file = "last_seen_id.txt"
 
 def retrieve_last_seen_id():
@@ -55,7 +55,6 @@ def store_last_seen_id(last_seen_id):
     with open(last_seen_id_file, "w") as f:
         f.write(str(last_seen_id))
 
-# --- Get AI-generated response using OpenAI ---
 def get_ai_response(user_question: str) -> str:
     try:
         response = openai_client.chat.completions.create(
@@ -69,7 +68,6 @@ def get_ai_response(user_question: str) -> str:
         print(f"OpenAI API error: {e}")
         raise
 
-# --- Fetch news articles from NewsAPI ---
 def fetch_news(query=None, category=None, country="us"):
     url = "https://newsapi.org/v2/top-headlines"
     params = {"apiKey": NEWS_API_KEY, "country": country}
@@ -84,12 +82,10 @@ def fetch_news(query=None, category=None, country="us"):
     data = response.json()
     return data.get("articles", [])
 
-# --- Helper to get username from user ID ---
 def get_username(user_id):
     user_data = client.get_user(id=user_id)
     return user_data.data.username
 
-# --- Process mentions and reply ---
 def reply_to_mentions():
     print("Checking for mentions...")
     last_seen_id = retrieve_last_seen_id()
@@ -107,30 +103,24 @@ def reply_to_mentions():
     for mention in reversed(mentions.data):
         print(f"Processing mention from user_id={mention.author_id}: {mention.text}")
 
-        # Skip if self-reply
         if mention.author_id == BOT_ID:
             continue
 
-        # Remove @botname from text
         user_question = mention.text.replace(f"@{BOT_USERNAME}", "").strip()
 
-        # Only reply if it's a question
         if not user_question.endswith("?"):
             continue
 
         user_lower = user_question.lower()
 
-        # Detect if user wants news or summaries
-        wants_summary = any(keyword in user_lower for keyword in ["summary", "summarize", "summarise"])
-        wants_news = any(keyword in user_lower for keyword in ["news", "sports", "movies", "weather", "headlines"])
+        wants_summary = any(k in user_lower for k in ["summary", "summarize", "summarise"])
+        wants_news = any(k in user_lower for k in ["news", "sports", "movies", "weather", "headlines"])
 
         if wants_news:
-            # Extract possible topic or location from question by removing keywords
-            for keyword in ["news", "sports", "movies", "weather", "headlines"]:
-                user_question = user_question.replace(keyword, "")
+            for k in ["news", "sports", "movies", "weather", "headlines"]:
+                user_question = user_question.replace(k, "")
             topic = user_question.strip() or None
 
-            # Fetch news articles
             articles = fetch_news(query=topic)
 
             if not articles:
@@ -146,15 +136,11 @@ def reply_to_mentions():
                     reply_lines = [f"{i+1}. {a.get('title')} - {a.get('url')}" for i, a in enumerate(articles[:3])]
                     reply_text = f"@{get_username(mention.author_id)} Here are some recent articles:\n" + "\n".join(reply_lines)
         else:
-            # Default: ask AI for answer
             answer = get_ai_response(user_question)
             reply_text = f"@{get_username(mention.author_id)} {answer}"
 
         try:
-            client.create_tweet(
-                text=reply_text,
-                in_reply_to_tweet_id=mention.id
-            )
+            client.create_tweet(text=reply_text, in_reply_to_tweet_id=mention.id)
             print(f"Replied to {mention.author_id}")
         except Exception as e:
             print(f"Error replying: {e}")
@@ -163,6 +149,17 @@ def reply_to_mentions():
 
 # --- FastAPI app ---
 app = FastAPI()
+
+@app.on_event("startup")
+async def start_mention_poller():
+    async def poll_mentions():
+        while True:
+            try:
+                reply_to_mentions()
+            except Exception as e:
+                print(f"Error in mention poller: {e}")
+            await asyncio.sleep(30)
+    asyncio.create_task(poll_mentions())
 
 @app.get("/")
 def read_root():
@@ -177,14 +174,7 @@ def ask_bot(q: Question):
         question_clean = re.sub(r"@\w+", "", q.question).strip()
         if not question_clean:
             raise HTTPException(status_code=400, detail="Empty question after cleaning mentions")
-
         answer = get_ai_response(question_clean)
         return {"answer": answer}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
-
-# --- Run mention poller in background if running standalone ---
-if __name__ == "__main__":
-    while True:
-        reply_to_mentions()
-        time.sleep(30)
