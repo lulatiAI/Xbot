@@ -6,79 +6,64 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
-# Load environment variables from .env file (for local dev)
+# Load environment variables from .env or deployment environment
 load_dotenv()
 
-# --- API Keys & Config ---
+# --- API Keys from environment ---
 API_KEY = os.getenv("API_KEY")
-API_KEY_SECRET = os.getenv("API_KEY_SECRET")  # Corrected name
+API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
-BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 AI_BACKEND_URL = os.getenv("AI_BACKEND_URL")
+BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 
-if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_SECRET, NEWS_API_KEY, AI_BACKEND_URL]):
-    raise ValueError("Missing one or more required environment variables.")
-
-# --- Authenticate with X (Twitter) API ---
+# --- Authenticate with Twitter/X API ---
 auth = tweepy.OAuth1UserHandler(API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_SECRET)
 api = tweepy.API(auth)
 
 BOT_ID = api.verify_credentials().id
 BOT_HANDLE = api.me().screen_name.lower()
-last_seen_id = None  # This could be persisted in a file if needed
+last_seen_id = None  # Optional: persist in a file or DB
 
-# --- Local city/state list ---
+# --- Local city/state keywords ---
 LOCAL_PLACES = [
     "chicago", "new york", "los angeles", "atlanta", "houston", "dallas",
     "miami", "washington", "north carolina", "south carolina", "detroit",
     "baltimore", "philadelphia", "new orleans", "oakland"
 ]
 
-# --- FastAPI App ---
-app = FastAPI()
-
-@app.get("/")
-def home():
-    return {"message": "X Bot is running"}
-
-# --- Utility Functions ---
+# --- Helper: Get news from NewsAPI ---
 def get_news(query):
-    """Fetch latest news articles from NewsAPI for a given query."""
-    url = (
-        f"https://newsapi.org/v2/everything"
-        f"?q={query}&apiKey={NEWS_API_KEY}&language=en&sortBy=publishedAt&pageSize=3"
-    )
+    url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}&language=en&pageSize=3"
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        articles = response.json().get("articles", [])
-        return [
-            f"{a['title']} - {a['url']}" for a in articles
-            if a.get("title") and a.get("url")
-        ]
+        response = requests.get(url)
+        data = response.json()
+        if "articles" in data:
+            return [
+                f"{article['title']} - {article['url']}"
+                for article in data["articles"]
+            ]
     except Exception as e:
         print(f"Error fetching news: {e}")
-        return []
+    return []
 
-def generate_ai_response(prompt):
-    """Send prompt to AI backend and return the generated text."""
+# --- Helper: Call AI backend for a response ---
+def call_ai_backend(prompt):
     try:
         resp = requests.post(
             AI_BACKEND_URL,
             json={"prompt": prompt},
-            timeout=20
+            timeout=30
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("response", "No response from AI backend.")
+        if resp.status_code == 200:
+            return resp.json().get("response", "")
     except Exception as e:
-        print(f"Error contacting AI backend: {e}")
-        return "Sorry, I couldn't process that request right now."
+        print(f"AI backend error: {e}")
+    return "Sorry, I couldn’t process that right now."
 
-def reply_to_mentions():
-    """Check mentions and reply with AI or news content."""
+# --- Bot Logic: Check mentions and reply ---
+def check_mentions():
     global last_seen_id
     mentions = api.mentions_timeline(
         since_id=last_seen_id,
@@ -86,38 +71,48 @@ def reply_to_mentions():
     )
     for mention in reversed(mentions):
         last_seen_id = mention.id
-        user = mention.user.screen_name
         text = mention.full_text.lower()
-
+        user = mention.user.screen_name
         print(f"New mention from @{user}: {text}")
 
+        # If user mentions a local place, fetch related news
         if any(place in text for place in LOCAL_PLACES):
-            # Fetch local news
-            news_results = get_news(text)
-            if news_results:
-                reply = f"Here are the latest news updates:\n" + "\n".join(news_results)
+            place = next(place for place in LOCAL_PLACES if place in text)
+            news_items = get_news(place)
+            if news_items:
+                reply = f"Here are the latest updates for {place}:\n" + "\n".join(news_items)
             else:
-                reply = "Sorry, I couldn't find any recent news for that location."
+                reply = f"Sorry, I couldn’t find any recent news for {place}."
         else:
-            # Generate AI response
-            reply = generate_ai_response(text)
+            # Default: send text to AI backend
+            reply = call_ai_backend(text)
 
         try:
             api.update_status(
                 status=f"@{user} {reply}",
                 in_reply_to_status_id=mention.id
             )
+            print(f"Replied to @{user}")
         except Exception as e:
-            print(f"Error replying to mention: {e}")
+            print(f"Error replying to @{user}: {e}")
 
-def run_bot_loop():
-    """Background loop to keep checking mentions."""
+# --- Thread loop to keep checking mentions ---
+def run_bot():
     while True:
-        try:
-            reply_to_mentions()
-        except Exception as e:
-            print(f"Error in bot loop: {e}")
-        time.sleep(60)  # check every 60 seconds
+        check_mentions()
+        time.sleep(60)  # check every minute
 
-# Start the bot loop in a background thread
-threading.Thread(target=run_bot_loop, daemon=True).start()
+# --- FastAPI app ---
+app = FastAPI()
+
+@app.get("/")
+def home():
+    return {"message": "X Bot is running"}
+
+@app.post("/trigger-bot")
+def trigger_bot():
+    check_mentions()
+    return {"status": "checked mentions"}
+
+# --- Start bot in a separate thread ---
+threading.Thread(target=run_bot, daemon=True).start()
