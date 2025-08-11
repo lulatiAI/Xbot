@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import re
+from openai import OpenAI
 
 # --- Load environment variables ---
 load_dotenv()
@@ -17,6 +18,13 @@ ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "LulatiAi")  # Default bot username
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY is not set in environment variables")
+
+# --- Initialize OpenAI client ---
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- Authenticate with Twitter API v2 ---
 client = tweepy.Client(
@@ -48,12 +56,9 @@ def store_last_seen_id(last_seen_id):
         f.write(str(last_seen_id))
 
 # --- Get AI-generated response using OpenAI ---
-def get_ai_response(user_question):
-    import openai
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-
+def get_ai_response(user_question: str) -> str:
     try:
-        response = openai.ChatCompletion.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": user_question}],
             max_tokens=150,
@@ -116,7 +121,7 @@ def reply_to_mentions():
         user_lower = user_question.lower()
 
         # Detect if user wants news or summaries
-        wants_summary = "summary" in user_lower or "summarize" in user_lower or "summarise" in user_lower
+        wants_summary = any(keyword in user_lower for keyword in ["summary", "summarize", "summarise"])
         wants_news = any(keyword in user_lower for keyword in ["news", "sports", "movies", "weather", "headlines"])
 
         if wants_news:
