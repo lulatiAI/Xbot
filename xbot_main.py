@@ -1,89 +1,62 @@
 import os
-import logging
+import time
 import tweepy
 import requests
-from fastapi import FastAPI
-from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
+from fastapi import FastAPI
 
-# Load env vars if running locally
+# --- Load environment variables ---
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Environment variables
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # Correct usage
+AI_BACKEND_URL = os.getenv("AI_BACKEND_URL")
 
-# Validate required env vars
-required_vars = {
-    "API_KEY": API_KEY,
-    "API_KEY_SECRET": API_KEY_SECRET,
-    "ACCESS_TOKEN": ACCESS_TOKEN,
-    "ACCESS_SECRET": ACCESS_SECRET,
-    "BEARER_TOKEN": BEARER_TOKEN,
-    "NEWS_API_KEY": NEWS_API_KEY
-}
-
-for var, value in required_vars.items():
-    if not value:
-        logger.error(f"Missing environment variable: {var}")
-
-# Twitter authentication
+# --- Authenticate with X API ---
 auth = tweepy.OAuth1UserHandler(API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_SECRET)
-twitter_api = tweepy.API(auth)
+api = tweepy.API(auth)
 
-# FastAPI app
-app = FastAPI()
+BOT_ID = api.verify_credentials().id
+BOT_HANDLE = api.me().screen_name.lower()
 
-def get_top_headlines():
-    """Fetch top news headlines from NewsAPI"""
-    url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
-    response = requests.get(url)
-    if response.status_code != 200:
-        logger.error(f"News API error: {response.status_code} - {response.text}")
-        return []
-    data = response.json()
-    return [article["title"] for article in data.get("articles", []) if "title" in article]
+# Track last processed mention
+last_seen_id_file = "last_seen_id.txt"
 
-def tweet_news_headlines():
-    """Post top news headlines to Twitter"""
-    headlines = get_top_headlines()
-    if not headlines:
-        logger.warning("No headlines to tweet.")
-        return
-    for headline in headlines[:5]:
-        try:
-            twitter_api.update_status(headline)
-            logger.info(f"Tweeted: {headline}")
-        except Exception as e:
-            logger.error(f"Error tweeting headline: {e}")
+def retrieve_last_seen_id():
+    try:
+        with open(last_seen_id_file, "r") as f:
+            return int(f.read().strip())
+    except FileNotFoundError:
+        return None
 
-@app.get("/")
-def home():
-    return {"message": "XBot is running"}
+def store_last_seen_id(last_seen_id):
+    with open(last_seen_id_file, "w") as f:
+        f.write(str(last_seen_id))
 
-@app.post("/tweet-news")
-def tweet_news():
-    tweet_news_headlines()
-    return {"status": "success", "message": "News headlines tweeted"}
+# --- Get AI-generated response ---
+def get_ai_response(user_question):
+    try:
+        resp = requests.post(
+            f"{AI_BACKEND_URL}/chat",
+            json={"prompt": user_question},
+            timeout=15
+        )
+        if resp.status_code == 200:
+            return resp.json().get("response", "I’m not sure how to answer that right now.")
+        else:
+            return "Hmm, I’m having trouble thinking right now."
+    except Exception as e:
+        return f"Error: {e}"
 
-# Scheduler to tweet every hour
-scheduler = BackgroundScheduler()
-scheduler.add_job(tweet_news_headlines, "interval", hours=1)
-scheduler.start()
+# --- Process mentions ---
+def reply_to_mentions():
+    print("Checking for mentions...")
+    last_seen_id = retrieve_last_seen_id()
+    mentions = api.mentions_timeline(since_id=last_seen_id, tweet_mode="extended")
 
-@app.on_event("shutdown")
-def shutdown_event():
-    scheduler.shutdown()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
+    for mention in reversed(mentions):
+        print(f"Processing mention from @{men
